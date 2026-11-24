@@ -22,7 +22,7 @@
 2. **자기완결성** — 각 step 파일은 독립된 Claude 세션에서 실행된다. "이전 대화에서 논의한 바와 같이" 같은 외부 참조는 금지한다. 필요한 정보는 전부 파일 안에 적는다.
 3. **사전 준비 강제** — 관련 문서 경로와 이전 step에서 생성/수정된 파일 경로를 명시한다. 세션이 코드를 읽고 맥락을 파악한 뒤 작업하도록 유도한다.
 4. **시그니처 수준 지시** — 함수/클래스의 인터페이스만 제시하고 내부 구현은 에이전트 재량에 맡긴다. 단, 설계 의도에서 벗어나면 안 되는 핵심 규칙(멱등성, 보안, 데이터 무결성 등)은 반드시 명시한다.
-5. **AC는 실행 가능한 커맨드** — "~가 동작해야 한다" 같은 추상적 서술이 아닌 `npm run build && npm test` 같은 실제 실행 가능한 검증 커맨드를 포함한다.
+5. **AC는 실행 가능한 커맨드** — "~가 동작해야 한다" 같은 추상적 서술이 아닌 `npm run build && npm test` 같은 실제 실행 가능한 검증 커맨드를 포함한다. execute.py가 step 세션 종료 후 `## Acceptance Criteria` 섹션의 첫 ```bash 블록을 프로젝트 루트에서 `bash -e -x -o pipefail`로 독립 재실행하고, exit code 0일 때만 통과로 인정한다. 따라서 AC 블록은 반드시 존재해야 하며(없으면 실행 거부), 사람 입력이 필요 없는 비대화형 커맨드로만 작성한다.
 6. **주의사항은 구체적으로** — "조심해라" 대신 "X를 하지 마라. 이유: Y" 형식으로 적는다.
 7. **네이밍** — step name은 kebab-case slug로, 해당 step의 핵심 모듈/작업을 한두 단어로 표현한다 (예: `project-setup`, `api-layer`, `auth-flow`).
 
@@ -126,7 +126,8 @@ npm test        # 테스트 통과
 ## 금지사항
 
 - {이 step에서 하지 말아야 할 것. "X를 하지 마라. 이유: Y" 형식}
-- 기존 테스트를 깨뜨리지 마라
+- 기존 테스트를 깨뜨리거나, 삭제하거나, 통과시키려고 약화시키지 마라. 이유: 테스트가 유일한 객관적 검증 수단이다
+- git commit을 하지 마라. 이유: 하네스가 검증 통과 후에만 커밋한다
 ```
 
 ### E. 실행
@@ -136,16 +137,31 @@ python3 scripts/execute.py {task-name}        # 순차 실행
 python3 scripts/execute.py {task-name} --push  # 실행 후 push
 ```
 
+Python이 없고 `uv`만 있는 환경(예: 이 Windows PC)에서는 `uv run --no-project python scripts/execute.py {task-name}`.
+
 execute.py가 자동으로 처리하는 것:
 
 - `feat-{task-name}` 브랜치 생성/checkout
 - 가드레일 주입 — CLAUDE.md + docs/*.md 내용을 매 step 프롬프트에 포함
-- 컨텍스트 누적 — 완료된 step의 summary를 다음 step 프롬프트에 전달
-- 자가 교정 — 실패 시 최대 3회 재시도하며, 이전 에러 메시지를 프롬프트에 피드백
-- 2단계 커밋 — 코드 변경(`feat`)과 메타데이터(`chore`)를 분리 커밋
+- 컨텍스트 누적 — 완료된 step의 summary를 다음 step 프롬프트에 전달 (한 건당 200자에서 자름)
+- 프롬프트 크기 감시 — 프롬프트는 stdin으로 전달(명령줄 길이 제한 없음). 30,000자를 넘으면 경고하고 metrics에 규칙 문서/요약/step 파일별 크기를 기록. 경고가 나오면 docs를 지도(목차) 방식으로 바꿀 시점이다
+- AC 독립 재검증 — 세션이 `completed`로 기록해도 하네스가 AC를 직접 재실행해 통과해야만 완료 처리
+- 테스트 보호 — step 시작 시점 대비 기존 테스트 파일이 삭제되면 AC를 돌리지 않고 실패 처리(수정된 테스트는 metrics에 기록)
+- 자가 교정 — 실패 시 최대 3회 재시도하며, 이전 에러 메시지(AC 재검증 실패 시 실제 출력)를 프롬프트에 피드백
+- 2단계 커밋 — 검증 통과 후에만 코드 변경(`feat`)과 메타데이터(`chore`)를 분리 커밋. 세션이 직접 만든 커밋은 soft reset으로 회수
+- 측정 — 모든 시도를 `phases/{task-name}/metrics.jsonl`에 기록 (세션 보고 상태, 검증 결과, 비용, 턴 수, 시간, session_id)
 - 타임스탬프 — started_at, completed_at, failed_at, blocked_at 자동 기록
 
 에러 복구:
 
-- **error 발생 시**: `phases/{task-name}/index.json`에서 해당 step의 `status`를 `"pending"`으로 바꾸고 `error_message`를 삭제한 뒤 재실행한다.
+- **error 발생 시**: 실패 기록(`index.json`, `metrics.jsonl`)만 `chore(...): step N failed`로 커밋되고, 검증을 통과하지 못한 코드 변경은 커밋되지 않은 채 working tree에 남아 있다. 내용을 확인해 유지하거나 되돌린 뒤(`phases/` 아래 기록은 되돌리지 않는다), `phases/{task-name}/index.json`에서 해당 step의 `status`를 `"pending"`으로 바꾸고 `error_message`를 삭제한 뒤 재실행한다.
 - **blocked 발생 시**: `blocked_reason`에 적힌 사유를 해결한 뒤, `status`를 `"pending"`으로 바꾸고 `blocked_reason`을 삭제한 뒤 재실행한다.
+
+### F. 회고 (하네스 개선)
+
+phase 실행 후, 또는 step이 error로 끝났을 때 아래 순서로 하네스를 개선한다.
+
+1. `python3 scripts/report.py {task-name}` 으로 step별 시도 수, 잘못된 완료 보고(세션은 completed라 했지만 하네스 검증 실패), 비용·턴·시간을 확인한다.
+2. 숫자만으로 결론 내리지 않는다. 리포트가 가리키는 실패/중단 시도의 transcript를 직접 읽고 원인을 분류한다: step 범위 과다 / AC 부실 / 문서·컨텍스트 부족 / 환경 문제.
+3. 원인에 맞는 한 가지만 바꾼다(step 분할, AC 보강, docs 수정, 프롬프트 규칙). 여러 개를 동시에 바꾸면 무엇이 효과였는지 알 수 없다.
+4. 같은 종류의 phase를 다시 돌려 리포트를 비교한다. LLM 결과는 매번 달라지므로 한두 번의 차이로 단정하지 않는다.
