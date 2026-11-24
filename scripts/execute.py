@@ -10,6 +10,8 @@ import argparse
 import contextlib
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -54,6 +56,8 @@ class StepExecutor:
     """Phase 디렉토리 안의 step들을 순차 실행하는 하네스."""
 
     MAX_RETRIES = 3
+    AC_TIMEOUT = 900
+    AC_LOG_LIMIT = 3000
     FEAT_MSG = "feat({phase}): step {num} — {name}"
     CHORE_MSG = "chore({phase}): step {num} output"
     TZ = timezone(timedelta(hours=9))
@@ -215,7 +219,9 @@ class StepExecutor:
             f"1. 이전 step에서 작성된 코드를 확인하고 일관성을 유지하라.\n"
             f"2. 이 step에 명시된 작업만 수행하라. 추가 기능이나 파일을 만들지 마라.\n"
             f"3. 기존 테스트를 깨뜨리지 마라.\n"
-            f"4. AC(Acceptance Criteria) 검증을 직접 실행하라.\n"
+            f"4. AC(Acceptance Criteria) 검증을 직접 실행하라. "
+            f"세션 종료 후 하네스가 step 파일의 AC 커맨드를 독립적으로 재실행하며, "
+            f"실패하면 completed로 기록했더라도 실패로 처리된다.\n"
             f"5. /phases/{self._phase_dir_name}/index.json의 해당 step status를 업데이트하라:\n"
             f"   - AC 통과 → \"completed\" + \"summary\" 필드에 이 step의 산출물을 한 줄로 요약\n"
             f"   - {self.MAX_RETRIES}회 수정 시도 후에도 실패 → \"error\" + \"error_message\" 기록\n"
@@ -255,6 +261,36 @@ class StepExecutor:
             json.dump(output, f, indent=2, ensure_ascii=False)
 
         return output
+
+    # --- AC 독립 재검증 ---
+
+    @staticmethod
+    def _extract_ac(step_md: str) -> Optional[str]:
+        """step 파일의 '## Acceptance Criteria' 섹션에서 첫 코드 블록(bash)을 꺼낸다."""
+        section = re.search(r"^## Acceptance Criteria[ \t]*\n(.*?)(?=^## |\Z)", step_md, re.M | re.S)
+        if not section:
+            return None
+        block = re.search(r"```(?:bash|sh)?[ \t]*\n(.*?)```", section.group(1), re.S)
+        if not block or not block.group(1).strip():
+            return None
+        return block.group(1)
+
+    def _run_ac(self, script: str) -> tuple[bool, str]:
+        """AC 스크립트를 세션과 무관하게 bash로 실행한다. (통과 여부, 실패 로그)."""
+        # Windows에서 "bash"를 그대로 넘기면 System32의 WSL bash가 먼저 잡히므로 PATH 기준으로 찾는다.
+        bash = shutil.which("bash") or "bash"
+        try:
+            r = subprocess.run(
+                [bash, "-e", "-o", "pipefail", "-c", script],
+                cwd=self._root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", timeout=self.AC_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"AC 재검증 시간 초과 ({self.AC_TIMEOUT}s)"
+        if r.returncode == 0:
+            return True, ""
+        log = (r.stdout or "")[-self.AC_LOG_LIMIT:]
+        return False, f"하네스 AC 재검증 실패 (exit {r.returncode}). 실제 출력:\n{log}"
 
     # --- 헤더 & 검증 ---
 
@@ -296,6 +332,12 @@ class StepExecutor:
         done = sum(1 for s in self._read_json(self._index_file)["steps"] if s["status"] == "completed")
         prev_error = None
 
+        step_file = self._phase_dir / f"step{step_num}.md"
+        ac_script = self._extract_ac(step_file.read_text(encoding="utf-8")) if step_file.exists() else None
+        if step_file.exists() and ac_script is None:
+            print(f"  ERROR: {step_file} 에 '## Acceptance Criteria' bash 블록이 없어 검증할 수 없습니다.")
+            sys.exit(1)
+
         for attempt in range(1, self.MAX_RETRIES + 1):
             index = self._read_json(self._index_file)
             step_context = self._build_step_context(index)
@@ -313,14 +355,24 @@ class StepExecutor:
             status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
             ts = self._stamp()
 
+            ac_log = ""
             if status == "completed":
+                # 재검증 도중 중단돼도 미검증 step이 완료로 남지 않도록 통과 전까지는 pending으로 되돌린다.
                 for s in index["steps"]:
                     if s["step"] == step_num:
-                        s["completed_at"] = ts
+                        s["status"] = "pending"
                 self._write_json(self._index_file, index)
-                self._commit_step(step_num, step_name)
-                print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]")
-                return True
+                ac_ok, ac_log = self._run_ac(ac_script)
+                if ac_ok:
+                    for s in index["steps"]:
+                        if s["step"] == step_num:
+                            s["status"] = "completed"
+                            s["completed_at"] = ts
+                    self._write_json(self._index_file, index)
+                    self._commit_step(step_num, step_name)
+                    print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]")
+                    return True
+                print(f"  ✗ Step {step_num}: 세션은 completed로 보고했지만 AC 재검증 실패")
 
             if status == "blocked":
                 for s in index["steps"]:
@@ -333,7 +385,7 @@ class StepExecutor:
                 self._update_top_index("blocked")
                 sys.exit(2)
 
-            err_msg = next(
+            err_msg = ac_log or next(
                 (s.get("error_message", "Step did not update status") for s in index["steps"] if s["step"] == step_num),
                 "Step did not update status",
             )
@@ -343,6 +395,7 @@ class StepExecutor:
                     if s["step"] == step_num:
                         s["status"] = "pending"
                         s.pop("error_message", None)
+                        s.pop("summary", None)
                 self._write_json(self._index_file, index)
                 prev_error = err_msg
                 print(f"  ↻ Step {step_num}: retry {attempt}/{self.MAX_RETRIES} — {err_msg}")
@@ -350,6 +403,7 @@ class StepExecutor:
                 for s in index["steps"]:
                     if s["step"] == step_num:
                         s["status"] = "error"
+                        s.pop("summary", None)
                         s["error_message"] = f"[{self.MAX_RETRIES}회 시도 후 실패] {err_msg}"
                         s["failed_at"] = ts
                 self._write_json(self._index_file, index)

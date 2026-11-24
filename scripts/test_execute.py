@@ -557,3 +557,136 @@ class TestCheckBlockers:
         with pytest.raises(SystemExit) as exc_info:
             inst._check_blockers()
         assert exc_info.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# AC 독립 재검증
+# ---------------------------------------------------------------------------
+
+STEP_WITH_AC = textwrap.dedent("""\
+    # Step 2: UI
+
+    ## 작업
+
+    ```bash
+    echo not-ac
+    ```
+
+    ## Acceptance Criteria
+
+    ```bash
+    npm run build   # 컴파일 에러 없음
+    npm test
+    ```
+
+    ## 검증 절차
+
+    1. 위 AC 커맨드를 실행한다.
+""")
+
+
+class TestExtractAc:
+    def test_extracts_block_from_ac_section_only(self):
+        script = ex.StepExecutor._extract_ac(STEP_WITH_AC)
+        assert "npm run build" in script
+        assert "npm test" in script
+        assert "not-ac" not in script
+
+    def test_missing_section_returns_none(self):
+        assert ex.StepExecutor._extract_ac("# Step\n\n## 작업\n\n```bash\nls\n```\n") is None
+
+    def test_section_without_code_block_returns_none(self):
+        assert ex.StepExecutor._extract_ac("## Acceptance Criteria\n\n빌드가 되어야 한다.\n\n## 금지사항\n") is None
+
+
+class TestRunAc:
+    def test_passing_script(self, executor):
+        ok, log = executor._run_ac("true\n")
+        assert ok and log == ""
+
+    def test_failing_script_reports_exit_and_output(self, executor):
+        ok, log = executor._run_ac("echo boom-output\nexit 3\n")
+        assert not ok
+        assert "exit 3" in log
+        assert "boom-output" in log
+
+    def test_stops_at_first_failing_line(self, executor):
+        ok, log = executor._run_ac("false\necho should-not-run\n")
+        assert not ok
+        assert "should-not-run" not in log
+
+    def test_pipefail(self, executor):
+        ok, _ = executor._run_ac("false | true\n")
+        assert not ok
+
+    def test_runs_in_project_root(self, executor, tmp_project):
+        (tmp_project / "marker.txt").write_text("x")
+        ok, _ = executor._run_ac("test -f marker.txt\n")
+        assert ok
+
+
+class TestExecuteSingleStepAc:
+    STEP = {"step": 2, "name": "ui", "status": "pending"}
+
+    def _report_completed(self, executor):
+        """세션이 index.json에 completed를 기록한 것처럼 흉내낸다."""
+        def fake_invoke(step, preamble):
+            idx = executor._read_json(executor._index_file)
+            for s in idx["steps"]:
+                if s["step"] == 2:
+                    s["status"] = "completed"
+                    s["summary"] = "UI 완료"
+            executor._write_json(executor._index_file, idx)
+        return fake_invoke
+
+    def test_completed_and_ac_pass_commits(self, executor, phase_dir):
+        (phase_dir / "step2.md").write_text(STEP_WITH_AC, encoding="utf-8")
+        with patch.object(executor, "_invoke_claude", side_effect=self._report_completed(executor)), \
+             patch.object(executor, "_run_ac", return_value=(True, "")) as run_ac, \
+             patch.object(executor, "_commit_step") as commit:
+            assert executor._execute_single_step(self.STEP, "") is True
+        run_ac.assert_called_once()
+        commit.assert_called_once_with(2, "ui")
+        step = executor._read_json(executor._index_file)["steps"][2]
+        assert step["status"] == "completed"
+        assert "completed_at" in step
+
+    def test_completed_but_ac_fail_is_retried_then_error(self, executor, phase_dir):
+        (phase_dir / "step2.md").write_text(STEP_WITH_AC, encoding="utf-8")
+        ac_fail = (False, "하네스 AC 재검증 실패 (exit 1). 실제 출력:\nTS2304 error")
+        with patch.object(executor, "_invoke_claude", side_effect=self._report_completed(executor)) as invoke, \
+             patch.object(executor, "_run_ac", return_value=ac_fail), \
+             patch.object(executor, "_commit_step"), \
+             patch.object(executor, "_update_top_index") as top:
+            with pytest.raises(SystemExit) as exc_info:
+                executor._execute_single_step(self.STEP, "")
+        assert exc_info.value.code == 1
+        assert invoke.call_count == ex.StepExecutor.MAX_RETRIES
+        # 재시도 프롬프트에 실제 AC 출력이 피드백된다
+        assert "TS2304 error" in invoke.call_args_list[1][0][1]
+        step = executor._read_json(executor._index_file)["steps"][2]
+        assert step["status"] == "error"
+        assert "TS2304 error" in step["error_message"]
+        assert "summary" not in step
+        top.assert_called_once_with("error")
+
+    def test_status_is_pending_while_ac_runs(self, executor, phase_dir):
+        (phase_dir / "step2.md").write_text(STEP_WITH_AC, encoding="utf-8")
+
+        def interrupted_ac(script):
+            raise KeyboardInterrupt
+
+        with patch.object(executor, "_invoke_claude", side_effect=self._report_completed(executor)), \
+             patch.object(executor, "_run_ac", side_effect=interrupted_ac):
+            with pytest.raises(KeyboardInterrupt):
+                executor._execute_single_step(self.STEP, "")
+        step = executor._read_json(executor._index_file)["steps"][2]
+        assert step["status"] == "pending"
+
+    def test_missing_ac_block_exits_before_invoking(self, executor, phase_dir):
+        (phase_dir / "step2.md").write_text("# Step 2\n\n## 작업\n\nUI\n", encoding="utf-8")
+        with patch.object(executor, "_invoke_claude") as invoke:
+            with pytest.raises(SystemExit) as exc_info:
+                executor._execute_single_step(self.STEP, "")
+        assert exc_info.value.code == 1
+        invoke.assert_not_called()
