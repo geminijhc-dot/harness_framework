@@ -163,6 +163,18 @@ class StepExecutor:
             if r.returncode != 0:
                 print(f"  WARN: housekeeping 커밋 실패: {r.stderr.strip()}")
 
+    def _commit_failure_metadata(self, step_num: int):
+        """실패 기록(index·metrics)만 커밋한다. 코드 변경은 사람이 확인하도록 working tree에 남긴다."""
+        paths = [f"phases/{self._phase_dir_name}/index.json",
+                 f"phases/{self._phase_dir_name}/metrics.jsonl",
+                 "phases/index.json"]
+        paths = [p for p in paths if (Path(self._root) / p).exists()]
+        self._run_git("add", "--", *paths)
+        # 경로를 지정한 commit은 해당 경로만 커밋하므로, 세션이 stage해 둔 코드 변경은 섞이지 않는다.
+        r = self._run_git("commit", "-m", f"chore({self._phase_name}): step {step_num} failed", "--", *paths)
+        if r.returncode != 0 and "nothing" not in (r.stdout + r.stderr):
+            print(f"  WARN: 실패 기록 커밋 실패: {r.stderr.strip()}")
+
     # --- top-level index ---
 
     def _update_top_index(self, status: str):
@@ -325,7 +337,8 @@ class StepExecutor:
         """step 시작 시점 대비 삭제/수정된 기존 테스트 파일 목록 (deleted, modified)."""
         if not base:
             return [], []
-        r = self._run_git("diff", "--name-status", "--no-renames", base)
+        # git mv로 옮긴 테스트는 R 행(3필드)으로 나와 삭제로 치지 않는다.
+        r = self._run_git("diff", "--name-status", base)
         deleted, modified = [], []
         for line in r.stdout.splitlines():
             parts = line.split("\t")
@@ -515,6 +528,7 @@ class StepExecutor:
                     print(f"    Error: {err_msg}")
                     print(f"    변경 내용은 커밋되지 않고 working tree에 남아 있습니다.")
                     self._update_top_index("error")
+                    self._commit_failure_metadata(step_num)
                     sys.exit(1)
             finally:
                 if not recorded:

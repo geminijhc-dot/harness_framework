@@ -153,7 +153,7 @@ execute.py가 자동으로 처리하는 것:
 
 에러 복구:
 
-- **error 발생 시**: 검증을 통과하지 못한 변경은 커밋되지 않고 working tree에 남아 있다. 내용을 확인해 유지하거나 되돌린 뒤, `phases/{task-name}/index.json`에서 해당 step의 `status`를 `"pending"`으로 바꾸고 `error_message`를 삭제한 뒤 재실행한다.
+- **error 발생 시**: 실패 기록(`index.json`, `metrics.jsonl`)만 `chore(...): step N failed`로 커밋되고, 검증을 통과하지 못한 코드 변경은 커밋되지 않은 채 working tree에 남아 있다. 내용을 확인해 유지하거나 되돌린 뒤(`phases/` 아래 기록은 되돌리지 않는다), `phases/{task-name}/index.json`에서 해당 step의 `status`를 `"pending"`으로 바꾸고 `error_message`를 삭제한 뒤 재실행한다.
 - **blocked 발생 시**: `blocked_reason`에 적힌 사유를 해결한 뒤, `status`를 `"pending"`으로 바꾸고 `blocked_reason`을 삭제한 뒤 재실행한다.
 
 ### F. 회고 (하네스 개선)

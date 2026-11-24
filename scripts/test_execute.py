@@ -466,6 +466,13 @@ class TestInvokeClaude:
             executor._invoke_claude(step, "preamble")
         assert exc_info.value.code == 1
 
+    def test_timeout_becomes_failed_output(self, executor):
+        step = {"step": 2, "name": "ui"}
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("claude", 1800)):
+            output = executor._invoke_claude(step, "preamble")
+        assert output["exitCode"] == -1
+        assert "TIMEOUT" in output["stderr"]
+
     def test_timeout_is_1800(self, executor):
         mock_result = MagicMock(returncode=0, stdout="{}", stderr="")
         step = {"step": 2, "name": "ui"}
@@ -721,6 +728,13 @@ class TestSessionCommitsAndTests:
         assert deleted == ["tests/test_core.py"]
         assert modified == ["tests/test_other.py"]
 
+    def test_git_mv_of_test_is_not_deletion(self, git_executor, tmp_project):
+        base = git_executor._head()
+        (tmp_project / "tests" / "unit").mkdir()
+        _git(tmp_project, "mv", "tests/test_core.py", "tests/unit/test_core.py")
+        deleted, _ = git_executor._changed_test_files(base)
+        assert deleted == []
+
     @pytest.mark.parametrize("path,is_test", [
         ("tests/test_api.py", True), ("pkg/api_test.py", True), ("cmd/x_test.go", True),
         ("src/a.test.ts", True), ("src/a.spec.tsx", True), ("src/__tests__/a.js", True),
@@ -766,6 +780,7 @@ class TestExecuteSingleStepAc:
 
         def work():
             (tmp_project / "ui.py").write_text("broken\n", encoding="utf-8")
+            _git(tmp_project, "add", "ui.py")  # 세션이 stage까지 해둔 경우
 
         with patch.object(git_executor, "_invoke_claude", side_effect=_fake_session(git_executor, action=work)) as invoke, \
              patch.object(git_executor, "_run_ac", return_value=ac_fail), \
@@ -775,7 +790,11 @@ class TestExecuteSingleStepAc:
         assert exc_info.value.code == 1
         assert invoke.call_count == ex.StepExecutor.MAX_RETRIES
         assert "TS2304 error" in invoke.call_args_list[1][0][1]  # 실제 AC 출력이 재시도 프롬프트로
-        assert git_executor._head() == head_before  # 검증 실패 코드는 커밋하지 않음
+        # 실패 기록(index·metrics)만 커밋되고, 검증 실패 코드는 커밋되지 않는다
+        assert _git(tmp_project, "rev-parse", "HEAD~1") == head_before
+        assert _git(tmp_project, "log", "-1", "--format=%s") == "chore(mvp): step 2 failed"
+        committed = set(_git(tmp_project, "show", "--name-only", "--format=", "HEAD").splitlines())
+        assert committed == {"phases/0-mvp/index.json", "phases/0-mvp/metrics.jsonl"}
         assert (tmp_project / "ui.py").exists()     # 변경은 working tree에 남음
         step = git_executor._read_json(git_executor._index_file)["steps"][2]
         assert step["status"] == "error"
