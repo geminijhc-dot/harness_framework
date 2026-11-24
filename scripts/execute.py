@@ -58,6 +58,10 @@ class StepExecutor:
     MAX_RETRIES = 3
     AC_TIMEOUT = 900
     AC_LOG_LIMIT = 3000
+    # 이전 step 요약 한 건의 최대 길이. 세션이 길게 써도 다음 step 프롬프트가 무한히 커지지 않게 자른다.
+    SUMMARY_MAX_CHARS = 200
+    # step 프롬프트 크기 경고 기준. 넘으면 규칙 문서를 지도(목차) 방식으로 바꾸거나 요약을 줄일 시점이다.
+    PROMPT_BUDGET_CHARS = 30000
     FEAT_MSG = "feat({phase}): step {num} — {name}"
     CHORE_MSG = "chore({phase}): step {num} output"
     TZ = timezone(timedelta(hours=9))
@@ -206,8 +210,10 @@ class StepExecutor:
 
     @staticmethod
     def _build_step_context(index: dict) -> str:
+        limit = StepExecutor.SUMMARY_MAX_CHARS
         lines = [
-            f"- Step {s['step']} ({s['name']}): {s['summary']}"
+            f"- Step {s['step']} ({s['name']}): "
+            + (s["summary"] if len(s["summary"]) <= limit else s["summary"][:limit] + "…")
             for s in index["steps"]
             if s["status"] == "completed" and s.get("summary")
         ]
@@ -236,7 +242,7 @@ class StepExecutor:
             f"세션 종료 후 하네스가 step 파일의 AC 커맨드를 독립적으로 재실행하며, "
             f"실패하면 completed로 기록했더라도 실패로 처리된다.\n"
             f"5. /phases/{self._phase_dir_name}/index.json의 해당 step status를 업데이트하라:\n"
-            f"   - AC 통과 → \"completed\" + \"summary\" 필드에 이 step의 산출물을 한 줄로 요약\n"
+            f"   - AC 통과 → \"completed\" + \"summary\" 필드에 이 step의 산출물을 한 줄({self.SUMMARY_MAX_CHARS}자 이내)로 요약\n"
             f"   - {self.MAX_RETRIES}회 수정 시도 후에도 실패 → \"error\" + \"error_message\" 기록\n"
             f"   - 사용자 개입이 필요한 경우 (API 키, 인증, 수동 설정 등) → \"blocked\" + \"blocked_reason\" 기록 후 즉시 중단\n"
             f"6. git commit을 하지 마라. 하네스가 검증 통과 후 직접 커밋하며, "
@@ -255,10 +261,11 @@ class StepExecutor:
 
         prompt = preamble + step_file.read_text(encoding="utf-8")
         try:
+            # 프롬프트는 stdin으로 넘긴다. 인자로 넘기면 Windows 명령줄 길이 제한(약 32K자)에 걸려 실행이 실패한다.
             result = subprocess.run(
-                ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", prompt],
-                cwd=self._root, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=1800,
+                ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json"],
+                input=prompt, cwd=self._root, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=1800,
             )
         except subprocess.TimeoutExpired:
             result = types.SimpleNamespace(returncode=-1, stdout="", stderr="TIMEOUT: claude 세션이 1800초 내에 끝나지 않음")
@@ -415,7 +422,8 @@ class StepExecutor:
         prev_error = None
 
         step_file = self._phase_dir / f"step{step_num}.md"
-        ac_script = self._extract_ac(step_file.read_text(encoding="utf-8")) if step_file.exists() else None
+        step_md = step_file.read_text(encoding="utf-8") if step_file.exists() else ""
+        ac_script = self._extract_ac(step_md) if step_file.exists() else None
         if step_file.exists() and ac_script is None:
             print(f"  ERROR: {step_file} 에 '## Acceptance Criteria' bash 블록이 없어 검증할 수 없습니다.")
             sys.exit(1)
@@ -435,6 +443,14 @@ class StepExecutor:
             # 모든 시도를 metrics.jsonl에 한 줄씩 남긴다. 정상 분기에서 기록하지 못하면(중단·예외) finally에서 기록.
             row = {"ts": self._stamp(), "step": step_num, "name": step_name, "attempt": attempt,
                    "agent": "claude", "outcome": "interrupted"}
+            prompt_chars = len(preamble) + len(step_md)
+            row.update(prompt_chars=prompt_chars, guardrails_chars=len(guardrails),
+                       context_chars=len(step_context),
+                       over_budget=prompt_chars > self.PROMPT_BUDGET_CHARS)
+            if row["over_budget"] and attempt == 1:
+                print(f"  ⚠ 프롬프트 {prompt_chars:,}자 — 기준 {self.PROMPT_BUDGET_CHARS:,}자 초과 "
+                      f"(규칙 문서 {len(guardrails):,} / 이전 step 요약 {len(step_context):,} / step 파일 {len(step_md):,}). "
+                      f"문서를 지도(목차) 방식으로 바꾸거나 요약을 줄일 시점입니다.")
             recorded = False
             try:
                 t0 = time.monotonic()

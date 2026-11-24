@@ -47,5 +47,18 @@ def test_render_lists_failures(tmp_path):
     assert "step 1 #1 retry" in text and "transcript:" in text
 
 
+def test_render_flags_prompt_over_budget(tmp_path):
+    rows = [dict(ROWS[0], prompt_chars=1200), dict(ROWS[1], prompt_chars=45000, over_budget=True,
+                                                    guardrails_chars=40000, context_chars=3000)]
+    text = rp.render(rows, tmp_path)
+    assert "프롬프트 크기 기준 초과: 1회 (최대 45,000자" in text
+    assert "규칙 문서 40,000" in text
+    assert rp.summarize(rows)[1]["max_prompt"] == 45000
+
+
+def test_render_no_budget_warning_when_within():
+    assert "기준 초과" not in rp.render(ROWS, Path("."))
+
+
 def test_render_empty():
     assert "기록이 없습니다" in rp.render([], Path("."))

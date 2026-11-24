@@ -226,6 +226,17 @@ class TestBuildStepContext:
         result = ex.StepExecutor._build_step_context(index)
         assert result.startswith("## 이전 Step 산출물")
 
+    def test_long_summary_is_clipped(self):
+        limit = ex.StepExecutor.SUMMARY_MAX_CHARS
+        index = {"steps": [
+            {"step": 0, "name": "big", "status": "completed", "summary": "가" * (limit + 500)},
+            {"step": 1, "name": "small", "status": "completed", "summary": "짧음"},
+        ]}
+        result = ex.StepExecutor._build_step_context(index)
+        assert "가" * limit + "…" in result
+        assert "가" * (limit + 1) not in result
+        assert "짧음" in result and "짧음…" not in result
+
 
 # ---------------------------------------------------------------------------
 # _build_preamble
@@ -443,8 +454,11 @@ class TestInvokeClaude:
         assert "-p" in cmd
         assert "--dangerously-skip-permissions" in cmd
         assert "--output-format" in cmd
-        assert "PREAMBLE" in cmd[-1]
-        assert "UI를 구현하세요" in cmd[-1]
+        # 프롬프트는 명령줄 인자가 아니라 stdin으로 넘긴다 (Windows 명령줄 길이 제한 회피)
+        assert not any("PREAMBLE" in c for c in cmd)
+        stdin = mock_run.call_args[1]["input"]
+        assert "PREAMBLE" in stdin
+        assert "UI를 구현하세요" in stdin
 
     def test_saves_output_json(self, executor):
         mock_result = MagicMock(returncode=0, stdout='{"ok": true}', stderr="")
@@ -839,6 +853,25 @@ class TestExecuteSingleStepAc:
         assert step["status"] == "pending"
         [row] = _metrics(phase_dir)
         assert row["outcome"] == "interrupted"
+
+    def test_prompt_size_is_recorded_and_budget_warned(self, git_executor, phase_dir, capsys):
+        guardrails = "규칙" * 100
+        with patch.object(ex.StepExecutor, "PROMPT_BUDGET_CHARS", 50), \
+             patch.object(git_executor, "_invoke_claude", side_effect=_fake_session(git_executor)), \
+             patch.object(git_executor, "_run_ac", return_value=(True, "")):
+            git_executor._execute_single_step(self.STEP, guardrails)
+        [row] = _metrics(phase_dir)
+        assert row["guardrails_chars"] == len(guardrails)
+        assert row["prompt_chars"] > len(guardrails) + len(STEP_WITH_AC) - 1
+        assert row["context_chars"] > 0  # step 0, 1 요약
+        assert row["over_budget"] is True
+        assert "기준 50자 초과" in capsys.readouterr().out
+
+    def test_prompt_within_budget_is_not_flagged(self, git_executor, phase_dir):
+        with patch.object(git_executor, "_invoke_claude", side_effect=_fake_session(git_executor)), \
+             patch.object(git_executor, "_run_ac", return_value=(True, "")):
+            git_executor._execute_single_step(self.STEP, "")
+        assert _metrics(phase_dir)[0]["over_budget"] is False
 
     def test_missing_ac_block_exits_before_invoking(self, executor, phase_dir):
         (phase_dir / "step2.md").write_text("# Step 2\n\n## 작업\n\nUI\n", encoding="utf-8")

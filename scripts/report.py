@@ -33,8 +33,9 @@ def summarize(rows: list) -> dict:
     for r in rows:
         s = steps.setdefault(r["step"], {
             "name": r.get("name"), "attempts": 0, "false_completions": 0, "cost_usd": 0.0,
-            "turns": 0, "elapsed_s": 0, "tests_modified": set(), "outcome": None,
+            "turns": 0, "elapsed_s": 0, "tests_modified": set(), "outcome": None, "max_prompt": 0,
         })
+        s["max_prompt"] = max(s["max_prompt"], r.get("prompt_chars") or 0)
         s["attempts"] += 1
         s["false_completions"] += is_false_completion(r)
         s["cost_usd"] += r.get("cost_usd") or 0
@@ -63,13 +64,21 @@ def render(rows: list, root: Path) -> str:
     out.append(f"잘못된 완료 보고: {false_total}/{reported} "
                f"(세션이 completed라 했지만 하네스 검증 실패)")
     out.append(f"세션이 직접 커밋해 회수된 시도: {sum(1 for r in rows if r.get('session_committed'))}회")
+    over = [r for r in rows if r.get("over_budget")]
+    if over:
+        worst = max(over, key=lambda r: r.get("prompt_chars") or 0)
+        out.append(f"⚠ 프롬프트 크기 기준 초과: {len(over)}회 (최대 {worst.get('prompt_chars'):,}자 — "
+                   f"규칙 문서 {worst.get('guardrails_chars') or 0:,} / 이전 step 요약 {worst.get('context_chars') or 0:,}). "
+                   f"문서를 지도(목차) 방식으로 바꿀 시점")
     out.append("")
-    out.append(f"{'step':<5}{'name':<20}{'시도':>4}{'잘못된완료':>8}{'비용$':>8}{'턴':>5}{'시간s':>7}  결과 / 수정된 테스트")
+    out.append(f"{'step':<5}{'name':<20}{'시도':>4}{'잘못된완료':>8}{'비용$':>8}{'턴':>5}{'시간s':>7}{'프롬프트':>9}"
+               f"  결과 / 수정된 테스트")
     for num in sorted(steps):
         s = steps[num]
         tests = f" / tests: {', '.join(sorted(s['tests_modified']))}" if s["tests_modified"] else ""
         out.append(f"{num:<5}{(s['name'] or '')[:19]:<20}{s['attempts']:>4}{s['false_completions']:>8}"
-                   f"{s['cost_usd']:>8.2f}{s['turns']:>5}{s['elapsed_s']:>7}  {s['outcome']}{tests}")
+                   f"{s['cost_usd']:>8.2f}{s['turns']:>5}{s['elapsed_s']:>7}{s['max_prompt']:>9,}"
+                   f"  {s['outcome']}{tests}")
 
     failed = [r for r in rows if r.get("outcome") != "completed"]
     if failed:
