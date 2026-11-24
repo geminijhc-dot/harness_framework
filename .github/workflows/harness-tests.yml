@@ -1,0 +1,27 @@
+name: harness-tests
+
+# 하네스 본체(scripts/, .claude/hooks/)가 mac·Linux·Windows에서 동작하는지 검증한다.
+# 3.9는 macOS 기본 python3 버전이라 최소 지원 버전으로 함께 돌린다.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install pytest
+      # Windows에서도 Git Bash로 실행해 bash/grep 의존 경로를 실제와 같게 검증한다.
+      - run: python -m pytest scripts/ -q -p no:cacheprovider
+        shell: bash
