@@ -752,7 +752,13 @@ class TestSessionCommitsAndTests:
     @pytest.mark.parametrize("path,is_test", [
         ("tests/test_api.py", True), ("pkg/api_test.py", True), ("cmd/x_test.go", True),
         ("src/a.test.ts", True), ("src/a.spec.tsx", True), ("src/__tests__/a.js", True),
+        ("src/test/java/com/x/UserServiceTest.java", True), ("app/src/test/UserRepoTests.kt", True),
+        ("Tests/AppTests.swift", True), ("tests/Unit/UserTest.php", True), ("Api.Tests/UserTests.cs", True),
+        ("spec/models/user_spec.rb", True), ("test/user_test.rb", True), ("test/widget_test.dart", True),
+        ("test/app_test.exs", True), ("src/test/UserSpec.groovy", True), ("tests/integration.rs", True),
         ("src/testing_utils.py", False), ("src/latest.ts", False), ("docs/test-plan.md", False),
+        ("src/main/java/com/x/Contest.java", False), ("src/Testimony.kt", False),
+        ("src/lib.rs", False), ("tests/common/mod.rs", False), ("src/Inspec.kt", False),
     ])
     def test_test_file_pattern(self, path, is_test):
         assert bool(ex.StepExecutor.TEST_FILE_RE.search(path)) is is_test

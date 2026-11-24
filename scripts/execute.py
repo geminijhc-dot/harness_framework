@@ -320,9 +320,19 @@ class StepExecutor:
     # --- 세션 커밋 회수 & 테스트 보호 ---
 
     # 테스트 파일로 간주하는 경로. 오탐 시 재시도 3회가 낭비되므로 좁게 유지한다.
-    TEST_FILE_RE = re.compile(
-        r"(^|/)(test_[^/]+\.py|[^/]+_test\.(py|go)|[^/]+\.(test|spec)\.[cm]?[jt]sx?)$|(^|/)__tests__/"
-    )
+    # 주요 언어의 관례적인 테스트 파일명만 인식한다(대소문자 구분: Contest.java 같은 일반 파일은 제외).
+    TEST_FILE_RE = re.compile(r"""
+        (^|/)(
+            test_[^/]+\.py                              # Python: test_x.py
+          | [^/]+_test\.(py|go|rb|dart|exs)             # Python/Go/Ruby/Dart/Elixir: x_test.*
+          | [^/]+_spec\.rb                              # Ruby RSpec: x_spec.rb
+          | [^/]+\.(test|spec)\.[cm]?[jt]sx?            # JS/TS: x.test.ts, x.spec.jsx
+          | [^/]+Tests?\.(java|kt|cs|swift|php|scala)   # JVM/.NET/Swift/PHP: XTest.java, XTests.cs
+          | [^/]+Spec\.(kt|scala|groovy)                # Kotest/ScalaTest/Spock: XSpec.kt
+        )$
+      | (^|/)__tests__/                                 # Jest: __tests__/ 아래 전부
+      | (^|/)tests/[^/]+\.rs$                           # Rust 통합 테스트: tests/x.rs
+    """, re.X)
 
     def _head(self) -> Optional[str]:
         r = self._run_git("rev-parse", "HEAD")
